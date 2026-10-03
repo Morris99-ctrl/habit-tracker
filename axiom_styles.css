@@ -1,0 +1,182 @@
+/* =============================================================
+   AXIOM Custom CSS Stylesheet
+   Extracted from AXIOM.py for better maintainability
+   ============================================================= */
+
+/* Modern Colorful Gradient Application Background */
+.stApp {
+    background-attachment: fixed !important;
+    color: #f8fafc;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* Top Header Glow */
+.brand-title {
+    font-size: 2.3rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #ffffff 20%, #c084fc 70%, #f472b6 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.03em;
+    margin-bottom: 2px;
+}
+
+/* Glassmorphism Cards */
+.glass-panel {
+    background: rgba(18, 25, 43, 0.65);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-radius: 16px;
+    padding: 16px 20px;
+    margin-bottom: 12px;
+    box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.glass-panel:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 16px 36px -10px rgba(139, 92, 246, 0.25);
+}
+.glass-panel.completed-card {
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+/* Stat Metrics Tile */
+.stat-tile {
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    padding: 14px 16px;
+    text-align: center;
+    backdrop-filter: blur(10px);
+}
+.stat-value {
+    font-size: 1.8rem;
+    font-weight: 800;
+    color: #ffffff;
+    margin-top: 4px;
+}
+.stat-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #94a3b8;
+    font-weight: 600;
+}
+
+/* Dynamic Flame Badge */
+@keyframes flamePulse {
+    0% { transform: scale(1); filter: drop-shadow(0 0 4px rgba(249, 115, 22, 0.6)); }
+    50% { transform: scale(1.08); filter: drop-shadow(0 0 10px rgba(239, 68, 68, 0.9)); }
+    100% { transform: scale(1); filter: drop-shadow(0 0 4px rgba(249, 115, 22, 0.6)); }
+}
+.flame-streak {
+    display: inline-flex;
+    align-items: center;
+    background: linear-gradient(135deg, rgba(249, 115, 22, 0.2), rgba(239, 68, 68, 0.25));
+    border: 1px solid rgba(249, 115, 22, 0.5);
+    color: #fed7aa;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    animation: flamePulse 2.5s infinite ease-in-out;
+}
+
+/* Category Glow Pill */
+.category-pill {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 12px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #ffffff;
+    letter-spacing: 0.02em;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+/* Routine Tag */
+.routine-pill {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: #cbd5e1;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 0.7rem;
+    font-weight: 600;
+}
+
+/* Milestone Badge */
+.milestone-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+/* Quote Banner */
+.quote-banner {
+    background: rgba(15, 23, 42, 0.55);
+    border-left: 3px solid #c084fc;
+    padding: 10px 16px;
+    border-radius: 0 12px 12px 0;
+    margin-bottom: 18px;
+    font-style: italic;
+    color: #cbd5e1;
+    font-size: 0.88rem;
+}
+
+/* Heatmap Grid Styles */
+.heatmap-container {
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    padding: 16px;
+    overflow-x: auto;
+}
+.heatmap-cell {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    display: inline-block;
+    margin: 2px;
+    transition: transform 0.15s ease;
+}
+.heatmap-cell:hover {
+    transform: scale(1.3);
+    cursor: pointer;
+}
+
+/* Streamlit Input & Checkbox Adjustments */
+div[data-testid="stCheckbox"] label {
+    font-weight: 600;
+}
+
+/* Theme-specific styles */
+.theme-cosmic-aurora .stApp {
+    background: radial-gradient(circle at 12% 18%, rgba(99, 102, 241, 0.28) 0%, transparent 45%),
+                radial-gradient(circle at 88% 22%, rgba(236, 72, 153, 0.26) 0%, transparent 45%),
+                radial-gradient(circle at 50% 85%, rgba(16, 185, 129, 0.20) 0%, transparent 50%),
+                linear-gradient(135deg, #090d16 0%, #0f172a 45%, #1e1b4b 100%) !important;
+}
+
+.theme-sunset-ember .stApp {
+    background: radial-gradient(circle at 20% 20%, rgba(249, 115, 22, 0.32) 0%, transparent 50%),
+                radial-gradient(circle at 80% 80%, rgba(239, 68, 68, 0.28) 0%, transparent 50%),
+                linear-gradient(135deg, #150918 0%, #1e0f21 50%, #2e0d16 100%) !important;
+}
+
+.theme-cyber-emerald .stApp {
+    background: radial-gradient(circle at 20% 20%, rgba(16, 185, 129, 0.30) 0%, transparent 50%),
+                radial-gradient(circle at 80% 80%, rgba(6, 182, 212, 0.25) 0%, transparent 50%),
+                linear-gradient(135deg, #041412 0%, #07221d 50%, #031c26 100%) !important;
+}
+
+.theme-electric-neon .stApp {
+    background: radial-gradient(circle at 10% 30%, rgba(168, 85, 247, 0.32) 0%, transparent 45%),
+                radial-gradient(circle at 90% 70%, rgba(56, 189, 248, 0.30) 0%, transparent 45%),
+                linear-gradient(135deg, #05050a 0%, #0a0a18 50%, #14092b 100%) !important;
+}

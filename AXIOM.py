@@ -1,0 +1,1382 @@
+"""
+=============================================================
+             AXIOM — PREMIUM STREAMLIT HABIT TRACKER
+=============================================================
+A modern, habit-forming experience inspired by Streaks,
+Productive, Fabulous, and Habitica.
+
+Features:
+  - Vibrant customizable themes with colorful mesh & aurora gradients
+  - Glassmorphic card design with glowing accents and smooth hover effects
+  - Audio & visual celebration animations (confetti, chime, balloons)
+  - Motivational quote generator (Atomic Habits, Stoicism, Mastery)
+  - Time-of-day routine filters (🌅 Morning, ☀️ Afternoon, 🌙 Evening)
+  - 60-day interactive GitHub-style consistency activity heatmap
+  - Streak milestone system (🥉 Spark, 🥈 Momentum, 🥇 Discipline, 💎 21-Day Lock, 🏆 Iron Will, 👑 Legend)
+  - Mobile-optimized weekly matrix with inline day-by-day touch toggles
+  - Lifetime statistics, category distribution & leaderboards
+  - 100% pure Python + Streamlit + SQLite (no external DLL dependencies)
+=============================================================
+"""
+
+import os
+import sqlite3
+from datetime import datetime, date, timedelta
+import streamlit as st
+import streamlit.components.v1 as components
+from pathlib import Path
+
+# -------------------------------------------------------------
+# Database Setup & Migration
+# -------------------------------------------------------------
+DB_PATH = os.path.join(os.path.dirname(__file__), "habits.db")
+
+
+def get_db_connection():
+    """Returns a connection to the SQLite database with Row factory."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    """Initializes SQLite tables and seeds starter habits if empty."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Habits table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS habits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT,
+            category TEXT DEFAULT 'General',
+            icon TEXT DEFAULT '✨',
+            routine TEXT DEFAULT 'Anytime',
+            created_at TEXT NOT NULL,
+            archived INTEGER DEFAULT 0
+        )
+    """)
+
+    # Gracefully add routine column if upgrading from earlier schema
+    try:
+        cursor.execute("ALTER TABLE habits ADD COLUMN routine TEXT DEFAULT 'Anytime'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Habit completion logs table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS habit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            habit_id INTEGER NOT NULL,
+            completed_date TEXT NOT NULL,
+            notes TEXT,
+            UNIQUE(habit_id, completed_date),
+            FOREIGN KEY(habit_id) REFERENCES habits(id) ON DELETE CASCADE
+        )
+    """)
+    conn.commit()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS habit_dependencies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_habit_id INTEGER NOT NULL,
+            target_habit_id INTEGER NOT NULL,
+            relationship_type TEXT DEFAULT 'supports',
+            UNIQUE(source_habit_id, target_habit_id),
+            FOREIGN KEY(source_habit_id) REFERENCES habits(id) ON DELETE CASCADE,
+            FOREIGN KEY(target_habit_id) REFERENCES habits(id) ON DELETE CASCADE
+        )
+    """)
+
+    # Create performance indexes
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_habits_archived ON habits(archived)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_habit_logs_completed_date ON habit_logs(completed_date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_habit_logs_habit_id_date ON habit_logs(habit_id, completed_date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_habits_category ON habits(category)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_habits_routine ON habits(routine)")
+
+    conn.commit()
+
+    # Seed starter habits if database is brand new
+    cursor.execute("SELECT COUNT(*) AS count FROM habits")
+    if cursor.fetchone()["count"] == 0:
+        samples = [
+            ("Morning Workout", "30 mins cardio or strength training", "Fitness", "🏋️", "Morning"),
+            ("Drink 2L Water", "Hydrate and stay energized", "Health", "💧", "Anytime"),
+            ("Read 20 Minutes", "Read non-fiction or philosophy", "Learning", "📚", "Evening"),
+            ("Mindful Meditation", "10 mins guided box breathing", "Mindfulness", "🧘", "Morning"),
+            ("Deep Work Block", "90 mins distraction-free focus", "Productivity", "💻", "Afternoon"),
+        ]
+        today = date.today()
+        for name, desc, cat, icon, routine in samples:
+            cursor.execute("""
+                INSERT INTO habits (name, description, category, icon, routine, created_at, archived)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+            """, (name, desc, cat, icon, routine, (today - timedelta(days=21)).isoformat()))
+            habit_id = cursor.lastrowid
+
+            # Seed past completion history to showcase streaks and heatmap
+            for past_days in [0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 15, 16, 17, 18]:
+                log_date = (today - timedelta(days=past_days)).isoformat()
+                cursor.execute("""
+                    INSERT OR IGNORE INTO habit_logs (habit_id, completed_date)
+                    VALUES (?, ?)
+                """, (habit_id, log_date))
+
+        conn.commit()
+
+    conn.close()
+
+
+# -------------------------------------------------------------
+# Data Access & Business Logic
+# -------------------------------------------------------------
+def get_all_habits(include_archived=False):
+    """Retrieve habits from SQLite."""
+    conn = get_db_connection()
+    if include_archived:
+        rows = conn.execute("SELECT * FROM habits ORDER BY id ASC").fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM habits WHERE archived = 0 ORDER BY id ASC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def validate_habit_data(name, description, category, icon, routine):
+    """Validates habit input data and returns error messages."""
+    errors = []
+    
+    if not name or not name.strip():
+        errors.append("Habit name cannot be empty.")
+    elif len(name.strip()) > 100:
+        errors.append("Habit name cannot exceed 100 characters.")
+    
+    if description and len(description.strip()) > 500:
+        errors.append("Description cannot exceed 500 characters.")
+    
+    valid_categories = ["Fitness", "Health", "Learning", "Productivity", "Mindfulness", "Finance", "Other"]
+    if category not in valid_categories:
+        errors.append(f"Category must be one of: {', '.join(valid_categories)}")
+    
+    valid_emojis = ["🔥", "🏋️", "💧", "📚", "🧘", "💻", "🥗", "🎯", "🚶", "✍️", "💰", "😴", "✨", "🚴", "🍎", "🧠", "☕", "🎨", "📝", "💪", "🏃", "🏊", "🎯", "🎪", "🎮", "🎸", "🎹", "🎲"]
+    if icon not in valid_emojis:
+        errors.append(f"Icon must be a valid emoji from the list: {', '.join(valid_emojis[:10])}... (and {len(valid_emojis)-10} more)")
+    
+    valid_routines = ["Anytime", "Morning", "Afternoon", "Evening"]
+    if routine not in valid_routines:
+        errors.append(f"Routine must be one of: {', '.join(valid_routines)}")
+    
+    return errors
+
+
+def add_habit(name, description, category, icon, routine="Anytime"):
+    """Adds a new habit to the database."""
+    conn = get_db_connection()
+    try:
+        conn.execute("""
+            INSERT INTO habits (name, description, category, icon, routine, created_at, archived)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+        """, (name.strip(), description.strip(), category, icon, routine, date.today().isoformat()))
+        conn.commit()
+        return True, "Habit added successfully!"
+    except sqlite3.IntegrityError:
+        return False, f"A habit named '{name}' already exists."
+    finally:
+        conn.close()
+
+
+def add_habit_with_validation(name, description, category, icon, routine="Anytime"):
+    """Adds a new habit with enhanced validation."""
+    # Validate input
+    validation_errors = validate_habit_data(name, description, category, icon, routine)
+    if validation_errors:
+        return False, "; ".join(validation_errors)
+    
+    # Use the original add_habit function with validated data
+    return add_habit(name, description, category, icon, routine)
+
+
+def update_habit_with_validation(habit_id, name, description, category, icon, routine):
+    """Updates a habit with enhanced validation."""
+    # Validate input
+    validation_errors = validate_habit_data(name, description, category, icon, routine)
+    if validation_errors:
+        return False, "; ".join(validation_errors)
+    
+    # Check if habit exists and is not archived
+    conn = get_db_connection()
+    habit = conn.execute("SELECT * FROM habits WHERE id = ? AND archived = 0", (habit_id,)).fetchone()
+    conn.close()
+    
+    if not habit:
+        return False, "Habit not found or already archived."
+    
+    # Use the original update_habit function with validated data
+    return update_habit(habit_id, name, description, category, icon, routine)
+
+
+def update_habit(habit_id, name, description, category, icon, routine):
+    """Updates an existing habit."""
+    conn = get_db_connection()
+    try:
+        conn.execute("""
+            UPDATE habits
+            SET name = ?, description = ?, category = ?, icon = ?, routine = ?
+            WHERE id = ? AND archived = 0
+        """, (name.strip(), description.strip(), category, icon, routine, habit_id))
+        conn.commit()
+        return True, "Habit updated successfully!"
+    except sqlite3.IntegrityError:
+        return False, f"A habit named '{name}' already exists."
+    finally:
+        conn.close()
+
+
+def archive_habit(habit_id):
+    """Archives a habit (soft delete)."""
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE habits SET archived = 1 WHERE id = ?", (habit_id,))
+        conn.commit()
+        return True, "Habit archived successfully!"
+    finally:
+        conn.close()
+
+
+def delete_habit(habit_id):
+    """Deletes a habit and all associated logs."""
+    conn = get_db_connection()
+    conn.execute("DELETE FROM habits WHERE id = ?", (habit_id,))
+    conn.commit()
+    conn.close()
+
+
+def add_habit_dependency(source_habit_id, target_habit_id, relationship_type="supports"):
+    """Creates a dependency relationship between two habits."""
+    conn = get_db_connection()
+    try:
+        conn.execute("""
+            INSERT INTO habit_dependencies (source_habit_id, target_habit_id, relationship_type)
+            VALUES (?, ?, ?)
+        """, (source_habit_id, target_habit_id, relationship_type))
+        conn.commit()
+        return True, "Habit dependency added successfully!"
+    except sqlite3.IntegrityError:
+        return False, "Dependency relationship already exists or habit not found."
+    finally:
+        conn.close()
+
+
+def remove_habit_dependency(source_habit_id, target_habit_id):
+    """Removes a dependency relationship between two habits."""
+    conn = get_db_connection()
+    try:
+        conn.execute("DELETE FROM habit_dependencies WHERE source_habit_id = ? AND target_habit_id = ?",
+                    (source_habit_id, target_habit_id))
+        conn.commit()
+        return True, "Habit dependency removed successfully!"
+    finally:
+        conn.close()
+
+
+def get_habit_dependencies(habit_id, direction="both"):
+    """Gets all dependencies for a habit.
+    
+    Args:
+        habit_id: The habit ID to get dependencies for
+        direction: "both", "source", or "target" to filter dependencies
+    
+    Returns:
+        List of dependency dictionaries
+    """
+    conn = get_db_connection()
+    
+    if direction == "source":
+        rows = conn.execute("""
+            SELECT hd.id, hd.source_habit_id, hd.target_habit_id, hd.relationship_type,
+                   h2.name as target_name, h2.icon as target_icon
+            FROM habit_dependencies hd
+            JOIN habits h2 ON hd.target_habit_id = h2.id
+            WHERE hd.source_habit_id = ? AND h2.archived = 0
+            ORDER BY h2.name
+        """, (habit_id,)).fetchall()
+    elif direction == "target":
+        rows = conn.execute("""
+            SELECT hd.id, hd.source_habit_id, hd.target_habit_id, hd.relationship_type,
+                   h1.name as source_name, h1.icon as source_icon
+            FROM habit_dependencies hd
+            JOIN habits h1 ON hd.source_habit_id = h1.id
+            WHERE hd.target_habit_id = ? AND h1.archived = 0
+            ORDER BY h1.name
+        """, (habit_id,)).fetchall()
+    else:  # "both"
+        # Get both outgoing and incoming dependencies
+        source_rows = conn.execute("""
+            SELECT 'source' as direction, hd.id, hd.source_habit_id, hd.target_habit_id, hd.relationship_type,
+                   NULL as source_name, NULL as source_icon,
+                   h2.name as target_name, h2.icon as target_icon
+            FROM habit_dependencies hd
+            JOIN habits h2 ON hd.target_habit_id = h2.id
+            WHERE hd.source_habit_id = ? AND h2.archived = 0
+        """, (habit_id,)).fetchall()
+        
+        target_rows = conn.execute("""
+            SELECT 'target' as direction, hd.id, hd.source_habit_id, hd.target_habit_id, hd.relationship_type,
+                   h1.name as source_name, h1.icon as source_icon,
+                   NULL as target_name, NULL as target_icon
+            FROM habit_dependencies hd
+            JOIN habits h1 ON hd.source_habit_id = h1.id
+            WHERE hd.target_habit_id = ? AND h1.archived = 0
+        """, (habit_id,)).fetchall()
+        
+        rows = source_rows + target_rows
+        # Sort by the relevant name
+        rows.sort(key=lambda r: r.get('target_name') or r.get('source_name', ''))
+    
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_habits_with_dependencies(include_archived=False):
+    """Gets all habits with their dependency information."""
+    conn = get_db_connection()
+    
+    # Get all habits
+    habits = get_all_habits(include_archived)
+    
+    # For each habit, get dependencies
+    for habit in habits:
+        habit['dependencies'] = {
+            'supported_by': get_habit_dependencies(habit['id'], 'target'),
+            'supports': get_habit_dependencies(habit['id'], 'source'),
+            'total_dependencies': len(get_habit_dependencies(habit['id'], 'both'))
+        }
+    
+    conn.close()
+    return habits
+
+
+def update_habit_with_dependencies(habit_id, name, description, category, icon, routine, 
+                                   add_dependencies=None, remove_dependencies=None):
+    """Updates a habit and manages its dependencies."""
+    # Update the habit first
+    success, message = update_habit_with_validation(habit_id, name, description, category, icon, routine)
+    if not success:
+        return False, message
+    
+    # Handle dependency management
+    if add_dependencies:
+        for target_id in add_dependencies:
+            dep_success, dep_message = add_habit_dependency(habit_id, target_id)
+            if not dep_success:
+                return False, f"Failed to add dependency: {dep_message}"
+    
+    if remove_dependencies:
+        for target_id in remove_dependencies:
+            rem_success, rem_message = remove_habit_dependency(habit_id, target_id)
+            if not rem_success:
+                return False, f"Failed to remove dependency: {rem_message}"
+    
+    return True, "Habit and dependencies updated successfully!"
+
+
+def toggle_habit_completion(habit_id, target_date: date):
+    """Toggles completion status for a habit on a given date."""
+    date_str = target_date.isoformat()
+    conn = get_db_connection()
+    existing = conn.execute("""
+        SELECT id FROM habit_logs WHERE habit_id = ? AND completed_date = ?
+    """, (habit_id, date_str)).fetchone()
+
+    if existing:
+        conn.execute("DELETE FROM habit_logs WHERE id = ?", (existing["id"],))
+        completed = False
+    else:
+        conn.execute("""
+            INSERT INTO habit_logs (habit_id, completed_date)
+            VALUES (?, ?)
+        """, (habit_id, date_str))
+        completed = True
+
+    conn.commit()
+    conn.close()
+    return completed
+
+
+def get_completed_habit_ids_for_date(target_date: date) -> set:
+    """Returns set of habit_ids completed on target_date."""
+    conn = get_db_connection()
+    rows = conn.execute("""
+        SELECT habit_id FROM habit_logs WHERE completed_date = ?
+    """, (target_date.isoformat(),)).fetchall()
+    conn.close()
+    return {r["habit_id"] for r in rows}
+
+
+def get_all_completion_dates_for_habit(habit_id: int) -> set:
+    """Returns set of date objects when habit was completed."""
+    conn = get_db_connection()
+    rows = conn.execute("""
+        SELECT completed_date FROM habit_logs WHERE habit_id = ? ORDER BY completed_date ASC
+    """, (habit_id,)).fetchall()
+    conn.close()
+    dates = set()
+    for r in rows:
+        try:
+            dates.add(datetime.strptime(r["completed_date"], "%Y-%m-%d").date())
+        except ValueError:
+            pass
+    return dates
+
+
+def export_data():
+    """Exports all habit data to JSON format."""
+    import json
+    from datetime import datetime
+    
+    conn = get_db_connection()
+    
+    # Export habits
+    habits = conn.execute("SELECT * FROM habits ORDER BY id ASC").fetchall()
+    habits_data = [dict(r) for r in habits]
+    
+    # Export habit logs
+    logs = conn.execute("SELECT * FROM habit_logs ORDER BY habit_id, completed_date ASC").fetchall()
+    logs_data = [dict(r) for r in logs]
+    
+    conn.close()
+    
+    # Create export data structure
+    export_data = {
+        "export_date": datetime.now().isoformat(),
+        "version": "1.0",
+        "habits": habits_data,
+        "habit_logs": logs_data
+    }
+    
+    return json.dumps(export_data, indent=2)
+
+
+def import_data(json_data):
+    """Imports habit data from JSON format."""
+    import json
+    from datetime import datetime
+    
+    try:
+        data = json.loads(json_data)
+        
+        # Validate required fields
+        if "habits" not in data or "habit_logs" not in data:
+            return False, "Invalid data format. Missing required fields."
+        
+        conn = get_db_connection()
+        
+        # Clear existing data
+        conn.execute("DELETE FROM habit_logs")
+        conn.execute("DELETE FROM habits")
+        conn.commit()
+        
+        # Import habits
+        for habit in data["habits"]:
+            conn.execute("""
+                INSERT INTO habits (id, name, description, category, icon, routine, created_at, archived)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                habit.get("id"),
+                habit.get("name"),
+                habit.get("description"),
+                habit.get("category"),
+                habit.get("icon"),
+                habit.get("routine"),
+                habit.get("created_at"),
+                habit.get("archived", 0)
+            ))
+        
+        # Import habit logs
+        for log in data["habit_logs"]:
+            conn.execute("""
+                INSERT INTO habit_logs (id, habit_id, completed_date, notes)
+                VALUES (?, ?, ?, ?)
+            """, (
+                log.get("id"),
+                log.get("habit_id"),
+                log.get("completed_date"),
+                log.get("notes")
+            ))
+        
+        conn.commit()
+        conn.close()
+        return True, "Data imported successfully!"
+        
+    except json.JSONDecodeError:
+        return False, "Invalid JSON data format."
+    except Exception as e:
+        return False, f"Error importing data: {str(e)}"
+
+
+def backup_database():
+    """Creates a backup of the database."""
+    import shutil
+    from datetime import datetime
+    
+    backup_path = Path(__file__).parent / f"habits_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    shutil.copy2(DB_PATH, backup_path)
+    return str(backup_path)
+
+
+def calculate_streaks(habit_id: int) -> dict:
+    """
+    Calculates current streak, longest streak, and total completions for a habit.
+    """
+    dates = get_all_completion_dates_for_habit(habit_id)
+    if not dates:
+        return {"current_streak": 0, "longest_streak": 0, "total_completions": 0}
+
+    sorted_dates = sorted(dates)
+    total_completions = len(sorted_dates)
+
+    # 1. Calculate Longest Streak
+    longest_streak = 0
+    current_calc_streak = 0
+    prev_date = None
+
+    for d in sorted_dates:
+        if prev_date is None:
+            current_calc_streak = 1
+        elif d == prev_date + timedelta(days=1):
+            current_calc_streak += 1
+        else:
+            current_calc_streak = 1
+        longest_streak = max(longest_streak, current_calc_streak)
+        prev_date = d
+
+    # 2. Calculate Current Streak
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+
+    current_streak = 0
+    if today in dates:
+        check_date = today
+    elif yesterday in dates:
+        check_date = yesterday
+    else:
+        check_date = None
+
+    if check_date:
+        while check_date in dates:
+            current_streak += 1
+            check_date -= timedelta(days=1)
+
+    return {
+        "current_streak": current_streak,
+        "longest_streak": max(longest_streak, current_streak),
+        "total_completions": total_completions
+    }
+
+
+def get_daily_completion_counts(days=60) -> dict[str, int]:
+    """Returns a mapping of YYYY-MM-DD -> count of completed habits."""
+    conn = get_db_connection()
+    start_date = (date.today() - timedelta(days=days)).isoformat()
+    rows = conn.execute("""
+        SELECT completed_date, COUNT(*) AS count
+        FROM habit_logs
+        WHERE completed_date >= ?
+        GROUP BY completed_date
+        ORDER BY completed_date ASC
+    """, (start_date,)).fetchall()
+    conn.close()
+    return {r["completed_date"]: r["count"] for r in rows}
+
+
+def get_completions_by_category() -> dict:
+    """Returns completions breakdown grouped by category."""
+    conn = get_db_connection()
+    rows = conn.execute("""
+        SELECT h.category, COUNT(l.id) AS count
+        FROM habits h
+        LEFT JOIN habit_logs l ON h.id = l.habit_id
+        GROUP BY h.category
+    """).fetchall()
+    conn.close()
+    return {r["category"]: r["count"] for r in rows}
+
+
+# -------------------------------------------------------------
+# Gamification: Milestone Badges & Level System
+# -------------------------------------------------------------
+MILESTONES = [
+    (60, "👑 Legend", "#fbbf24", "Master of unbreakable habits"),
+    (30, "🏆 Iron Will", "#f59e0b", "30-day streak of pure discipline"),
+    (21, "💎 Habit Locked", "#06b6d4", "21-Day threshold conquered"),
+    (14, "🥇 Momentum", "#3b82f6", "Two full weeks unbroken"),
+    (7,  "🥈 Unstoppable", "#8b5cf6", "One complete week on fire"),
+    (3,  "🥉 Spark", "#ec4899", "3-day momentum activated"),
+]
+
+
+def get_streak_badge(streak: int):
+    """Returns the highest milestone badge earned for a streak count."""
+    for min_days, title, color, desc in MILESTONES:
+        if streak >= min_days:
+            return {"title": title, "color": color, "desc": desc, "min_days": min_days}
+    return None
+
+
+MOTIVATIONAL_QUOTES = [
+    ("We are what we repeatedly do. Excellence, then, is not an act, but a habit.", "Aristotle"),
+    ("You do not rise to the level of your goals. You fall to the level of your systems.", "James Clear, Atomic Habits"),
+    ("Every action you take is a vote for the type of person you wish to become.", "James Clear"),
+    ("Small disciplines repeated with consistency every day lead to great achievements.", "John C. Maxwell"),
+    ("First forget inspiration. Habit is more dependable. Habit will sustain you.", "Octavia Butler"),
+    ("Discipline is choosing between what you want now and what you want most.", "Abraham Lincoln"),
+    ("Motivation is what gets you started. Habit is what keeps you going.", "Jim Ryun"),
+    ("Success is the sum of small efforts, repeated day in and day out.", "Robert Collier"),
+    ("It is not that we have a short time to live, but that we waste a lot of it.", "Seneca"),
+]
+
+
+# -------------------------------------------------------------
+# Vibrant Theme Definitions & CSS Injection
+# -------------------------------------------------------------
+THEMES = {
+    "🌌 Cosmic Aurora": {
+        "bg": """
+            radial-gradient(circle at 12% 18%, rgba(99, 102, 241, 0.28) 0%, transparent 45%),
+            radial-gradient(circle at 88% 22%, rgba(236, 72, 153, 0.26) 0%, transparent 45%),
+            radial-gradient(circle at 50% 85%, rgba(16, 185, 129, 0.20) 0%, transparent 50%),
+            linear-gradient(135deg, #090d16 0%, #0f172a 45%, #1e1b4b 100%)
+        """,
+        "primary": "#8b5cf6",
+        "card_border": "rgba(139, 92, 246, 0.25)",
+        "card_hover": "rgba(236, 72, 153, 0.45)"
+    },
+    "🌅 Sunset Ember": {
+        "bg": """
+            radial-gradient(circle at 20% 20%, rgba(249, 115, 22, 0.32) 0%, transparent 50%),
+            radial-gradient(circle at 80% 80%, rgba(239, 68, 68, 0.28) 0%, transparent 50%),
+            linear-gradient(135deg, #150918 0%, #1e0f21 50%, #2e0d16 100%)
+        """,
+        "primary": "#f97316",
+        "card_border": "rgba(249, 115, 22, 0.3)",
+        "card_hover": "rgba(239, 68, 68, 0.5)"
+    },
+    "🌿 Cyber Emerald": {
+        "bg": """
+            radial-gradient(circle at 20% 20%, rgba(16, 185, 129, 0.30) 0%, transparent 50%),
+            radial-gradient(circle at 80% 80%, rgba(6, 182, 212, 0.25) 0%, transparent 50%),
+            linear-gradient(135deg, #041412 0%, #07221d 50%, #031c26 100%)
+        """,
+        "primary": "#10b981",
+        "card_border": "rgba(16, 185, 129, 0.28)",
+        "card_hover": "rgba(6, 182, 212, 0.5)"
+    },
+    "⚡ Electric Neon": {
+        "bg": """
+            radial-gradient(circle at 10% 30%, rgba(168, 85, 247, 0.32) 0%, transparent 45%),
+            radial-gradient(circle at 90% 70%, rgba(56, 189, 248, 0.30) 0%, transparent 45%),
+            linear-gradient(135deg, #05050a 0%, #0a0a18 50%, #14092b 100%)
+        """,
+        "primary": "#a855f7",
+        "card_border": "rgba(168, 85, 247, 0.35)",
+        "card_hover": "rgba(56, 189, 248, 0.55)"
+    }
+}
+
+CATEGORY_GRADIENTS = {
+    "Fitness": "linear-gradient(135deg, #f97316, #ef4444)",
+    "Health": "linear-gradient(135deg, #06b6d4, #10b981)",
+    "Learning": "linear-gradient(135deg, #8b5cf6, #ec4899)",
+    "Productivity": "linear-gradient(135deg, #3b82f6, #6366f1)",
+    "Mindfulness": "linear-gradient(135deg, #10b981, #14b8a6)",
+    "Finance": "linear-gradient(135deg, #f59e0b, #eab308)",
+    "Other": "linear-gradient(135deg, #64748b, #475569)",
+}
+
+
+def read_css_file():
+    """Reads the custom CSS from the external file."""
+    css_path = Path(__file__).parent / "axiom_styles.css"
+    try:
+        with open(css_path, 'r') as f:
+            return f.read()
+    except FileNotFoundError:
+        # Fallback to the embedded CSS if file doesn't exist
+        return ""
+
+
+def inject_custom_styles(theme_key: str):
+    """Injects custom styles with the chosen theme using external CSS file."""
+    # Read the base CSS from external file
+    css_content = read_css_file()
+    
+    if not css_content:
+        # Fallback to the original inline CSS if file reading fails
+        theme = THEMES.get(theme_key, THEMES["🌌 Cosmic Aurora"])
+        
+        # Rebuild the inline CSS for backward compatibility
+        css_content = f"""
+            .stApp {{
+                background: {theme["bg"]} !important;
+                background-attachment: fixed !important;
+                color: #f8fafc;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            }}
+            .brand-title {{
+                font-size: 2.3rem;
+                font-weight: 800;
+                background: linear-gradient(135deg, #ffffff 20%, #c084fc 70%, #f472b6 100%);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                letter-spacing: -0.03em;
+                margin-bottom: 2px;
+            }}
+            .glass-panel {{
+                background: rgba(18, 25, 43, 0.65);
+                backdrop-filter: blur(16px);
+                -webkit-backdrop-filter: blur(16px);
+                border: 1px solid {theme["card_border"]};
+                border-radius: 16px;
+                padding: 16px 20px;
+                margin-bottom: 12px;
+                box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+                transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            }}
+            .glass-panel:hover {{
+                border-color: {theme["card_hover"]};
+                transform: translateY(-2px);
+                box-shadow: 0 16px 36px -10px rgba(139, 92, 246, 0.25);
+            }}
+            .glass-panel.completed-card {{
+                background: rgba(16, 185, 129, 0.12);
+                border: 1px solid rgba(16, 185, 129, 0.4);
+            }}
+            .stat-tile {{
+                background: rgba(15, 23, 42, 0.7);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px;
+                padding: 14px 16px;
+                text-align: center;
+                backdrop-filter: blur(10px);
+            }}
+            .stat-value {{
+                font-size: 1.8rem;
+                font-weight: 800;
+                color: #ffffff;
+                margin-top: 4px;
+            }}
+            .stat-label {{
+                font-size: 0.75rem;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                color: #94a3b8;
+                font-weight: 600;
+            }}
+            @keyframes flamePulse {{
+                0% {{ transform: scale(1); filter: drop-shadow(0 0 4px rgba(249, 115, 22, 0.6)); }}
+                50% {{ transform: scale(1.08); filter: drop-shadow(0 0 10px rgba(239, 68, 68, 0.9)); }}
+                100% {{ transform: scale(1); filter: drop-shadow(0 0 4px rgba(249, 115, 22, 0.6)); }}
+            }}
+            .flame-streak {{
+                display: inline-flex;
+                align-items: center;
+                background: linear-gradient(135deg, rgba(249, 115, 22, 0.2), rgba(239, 68, 68, 0.25));
+                border: 1px solid rgba(249, 115, 22, 0.5);
+                color: #fed7aa;
+                padding: 3px 10px;
+                border-radius: 20px;
+                font-size: 0.82rem;
+                font-weight: 700;
+                animation: flamePulse 2.5s infinite ease-in-out;
+            }}
+            .category-pill {{
+                display: inline-block;
+                padding: 2px 9px;
+                border-radius: 12px;
+                font-size: 0.72rem;
+                font-weight: 700;
+                color: #ffffff;
+                letter-spacing: 0.02em;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+            }}
+            .routine-pill {{
+                background: rgba(255, 255, 255, 0.08);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                color: #cbd5e1;
+                padding: 2px 8px;
+                border-radius: 10px;
+                font-size: 0.7rem;
+                font-weight: 600;
+            }}
+            .milestone-badge {{
+                display: inline-flex;
+                align-items: center;
+                padding: 2px 8px;
+                border-radius: 10px;
+                font-size: 0.72rem;
+                font-weight: 700;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }}
+            .quote-banner {{
+                background: rgba(15, 23, 42, 0.55);
+                border-left: 3px solid #c084fc;
+                padding: 10px 16px;
+                border-radius: 0 12px 12px 0;
+                margin-bottom: 18px;
+                font-style: italic;
+                color: #cbd5e1;
+                font-size: 0.88rem;
+            }}
+            .heatmap-container {{
+                background: rgba(15, 23, 42, 0.6);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px;
+                padding: 16px;
+                overflow-x: auto;
+            }}
+            .heatmap-cell {{
+                width: 14px;
+                height: 14px;
+                border-radius: 3px;
+                display: inline-block;
+                margin: 2px;
+                transition: transform 0.15s ease;
+            }}
+            .heatmap-cell:hover {{
+                transform: scale(1.3);
+                cursor: pointer;
+            }}
+            div[data-testid="stCheckbox"] label {{
+                font-weight: 600;
+            }}
+        """
+    
+    # Apply the theme-specific background
+    theme = THEMES.get(theme_key, THEMES["🌌 Cosmic Aurora"])
+    css_content += f"\n.stApp {{ background: {theme['bg']} !important; }}"
+    
+    st.markdown(f"""
+        <style>
+        {css_content}
+        </style>
+    """, unsafe_allow_html=True)
+
+
+# -------------------------------------------------------------
+# Interactive Celebration Audio & Confetti Component
+# -------------------------------------------------------------
+def trigger_celebration(title="Streak Celebrated!", sound=True):
+    """
+    Renders celebration confetti with a delightful audio chime using Web Audio API.
+    """
+    confetti_code = f"""
+    <div id="celebration-box" style="display:none;"></div>
+    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+    <script>
+        // Confetti Fireworks burst
+        function launchFireworks() {{
+            var duration = 2.5 * 1000;
+            var animationEnd = Date.now() + duration;
+            var defaults = {{ startVelocity: 30, spread: 360, ticks: 60, zIndex: 9999 }};
+
+            function randomInRange(min, max) {{
+                return Math.random() * (max - min) + min;
+            }}
+
+            var interval = setInterval(function() {{
+                var timeLeft = animationEnd - Date.now();
+                if (timeLeft <= 0) {{
+                    return clearInterval(interval);
+                }}
+                var particleCount = 50 * (timeLeft / duration);
+                confetti(Object.assign({{}}, defaults, {{
+                    particleCount,
+                    origin: {{ x: randomInRange(0.1, 0.3), y: Math.random() - 0.2 }}
+                }}));
+                confetti(Object.assign({{}}, defaults, {{
+                    particleCount,
+                    origin: {{ x: randomInRange(0.7, 0.9), y: Math.random() - 0.2 }}
+                }}));
+            }}, 250);
+        }}
+
+        // Pleasant 4-tone victory chime
+        function playChime() {{
+            try {{
+                var AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (!AudioCtx) return;
+                var ctx = new AudioCtx();
+                var notes = [523.25, 659.25, 783.99, 1046.50]; // C5, E5, G5, C6
+                notes.forEach(function(freq, i) {{
+                    var osc = ctx.createOscillator();
+                    var gain = ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(freq, ctx.currentTime + i * 0.08);
+                    gain.gain.setValueAtTime(0.08, ctx.currentTime + i * 0.08);
+                    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.08 + 0.25);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(ctx.currentTime + i * 0.08);
+                    osc.stop(ctx.currentTime + i * 0.08 + 0.25);
+                }});
+            }} catch(e) {{}}
+        }}
+
+        window.addEventListener('load', function() {{
+            launchFireworks();
+            {"playChime();" if sound else ""}
+        }});
+        launchFireworks();
+        {"playChime();" if sound else ""}
+    </script>
+    """
+    components.html(confetti_code, height=0)
+
+
+# -------------------------------------------------------------
+# Heatmap Component (Pure HTML/CSS - No Pandas/Plotly needed)
+# -------------------------------------------------------------
+def render_activity_heatmap(daily_counts: dict[str, int], days=56):
+    """
+    Renders a GitHub-style 8-week (56-day) consistency activity heatmap grid.
+    """
+    today = date.today()
+    # Align to full weeks (Sunday to Saturday or Monday to Sunday)
+    start_date = today - timedelta(days=days - 1)
+    # Adjust start to Monday
+    start_date = start_date - timedelta(days=start_date.weekday())
+
+    cells_html = []
+    current = start_date
+    col_cells = []
+
+    while current <= today:
+        date_str = current.isoformat()
+        count = daily_counts.get(date_str, 0)
+
+        # Intensity coloring
+        if count == 0:
+            color = "rgba(255, 255, 255, 0.06)"
+        elif count == 1:
+            color = "#4338ca" # Indigo 700
+        elif count == 2:
+            color = "#6366f1" # Indigo 500
+        elif count <= 4:
+            color = "#a855f7" # Purple 500
+        else:
+            color = "#10b981" # Bright Emerald
+
+        is_today = (current == today)
+        border = "1px solid #38bdf8" if is_today else "1px solid rgba(255,255,255,0.05)"
+        title = f"{current.strftime('%b %d, %Y')}: {count} completed"
+
+        col_cells.append(
+            f'<div class="heatmap-cell" style="background:{color}; border:{border};" title="{title}"></div>'
+        )
+
+        # On Sunday, end column
+        if current.weekday() == 6 or current == today:
+            cells_html.append(f'<div style="display:flex; flex-direction:column;">{"".join(col_cells)}</div>')
+            col_cells = []
+
+        current += timedelta(days=1)
+
+    heatmap_markup = f"""
+    <div class="heatmap-container">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <span style="font-weight:700; font-size:0.85rem; color:#cbd5e1;">60-Day Consistency Grid</span>
+            <div style="display:flex; align-items:center; gap:4px; font-size:0.7rem; color:#94a3b8;">
+                <span>Less</span>
+                <span class="heatmap-cell" style="background:rgba(255,255,255,0.06); width:10px; height:10px; margin:0;"></span>
+                <span class="heatmap-cell" style="background:#4338ca; width:10px; height:10px; margin:0;"></span>
+                <span class="heatmap-cell" style="background:#6366f1; width:10px; height:10px; margin:0;"></span>
+                <span class="heatmap-cell" style="background:#a855f7; width:10px; height:10px; margin:0;"></span>
+                <span class="heatmap-cell" style="background:#10b981; width:10px; height:10px; margin:0;"></span>
+                <span>More</span>
+            </div>
+        </div>
+        <div style="display:flex; gap:3px; overflow-x:auto; padding-bottom:6px;">
+            {"".join(cells_html)}
+        </div>
+    </div>
+    """
+    st.markdown(heatmap_markup, unsafe_allow_html=True)
+
+
+# -------------------------------------------------------------
+# Main Application
+# -------------------------------------------------------------
+def main():
+    st.set_page_config(
+        page_title="AXIOM — Habit Tracker",
+        page_icon="🔥",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    init_db()
+
+    # Session State for celebration alerts
+    if "celebration_pending" not in st.session_state:
+        st.session_state.celebration_pending = False
+    if "milestone_alert" not in st.session_state:
+        st.session_state.milestone_alert = None
+
+    # Sidebar: Visual Preferences & Add Habit
+    with st.sidebar:
+        st.markdown('<div class="brand-title">🔥 AXIOM</div>', unsafe_allow_html=True)
+        st.caption("Level up your consistency, day by day.")
+        st.divider()
+
+        # Theme Selector
+        st.subheader("🎨 Visual Atmosphere")
+        selected_theme = st.selectbox(
+            "Color Gradient Theme",
+            options=list(THEMES.keys()),
+            index=0,
+            label_visibility="collapsed"
+        )
+        sound_enabled = st.toggle("Enable Celebration Sound", value=True)
+
+        st.divider()
+
+        # Date Selector
+        st.subheader("📅 Target Date")
+        selected_date = st.date_input("Check-in Date", value=date.today())
+        is_today = (selected_date == date.today())
+        date_label = "Today" if is_today else selected_date.strftime("%b %d, %Y")
+
+        st.divider()
+
+        # Quick Add Habit Form
+        st.subheader("➕ Create Habit")
+        with st.form("new_habit_form", clear_on_submit=True):
+            h_name = st.text_input("Habit Name*", placeholder="e.g. Read 20 Pages")
+            h_cat = st.selectbox(
+                "Category",
+                ["Fitness", "Health", "Learning", "Productivity", "Mindfulness", "Finance", "Other"]
+            )
+            h_routine = st.selectbox(
+                "Daily Routine",
+                ["Anytime", "Morning", "Afternoon", "Evening"]
+            )
+            h_icon = st.selectbox(
+                "Emoji Icon",
+                ["🔥", "🏋️", "💧", "📚", "🧘", "💻", "🥗", "🎯", "🚶", "✍️", "💰", "😴", "✨", "🚴", "🍎"]
+            )
+            h_desc = st.text_input("Description (optional)", placeholder="e.g. Atomic Habits Chapter")
+
+            submitted = st.form_submit_button("Create Habit", use_container_width=True)
+            if submitted:
+                if not h_name.strip():
+                    st.error("Please enter a habit name.")
+                else:
+                    success, msg = add_habit(h_name, h_desc, h_cat, h_icon, h_routine)
+                    if success:
+                        st.success(msg)
+                        st.session_state.celebration_pending = True
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        st.divider()
+        st.caption("Offline SQLite database: `habits.db`")
+
+    # Inject chosen colorful gradient stylesheet
+    inject_custom_styles(selected_theme)
+
+    # Trigger celebration if flag was raised
+    if st.session_state.celebration_pending:
+        trigger_celebration(sound=sound_enabled)
+        st.session_state.celebration_pending = False
+
+    # Milestone toast alert
+    if st.session_state.milestone_alert:
+        m = st.session_state.milestone_alert
+        st.success(f"🎉 **NEW MILESTONE UNLOCKED!** {m['habit']} reached a {m['streak']}-day streak! Badge: **{m['badge']['title']}**")
+        st.session_state.milestone_alert = None
+
+    # Motivational Quote Header
+    quote_text, quote_author = MOTIVATIONAL_QUOTES[date.today().toordinal() % len(MOTIVATIONAL_QUOTES)]
+    st.markdown(
+        f'<div class="quote-banner">"{quote_text}" — <strong>{quote_author}</strong></div>',
+        unsafe_allow_html=True
+    )
+
+    # Habits Data
+    habits = get_all_habits()
+
+    if not habits:
+        st.info("No active habits yet. Use the sidebar on the left to add your first habit!")
+        return
+
+    # Navigation Tabs
+    tab_dashboard, tab_weekly, tab_analytics, tab_manage = st.tabs([
+        "📋 Daily Check-in",
+        "🗓️ Weekly Matrix",
+        "🏆 Milestones & Analytics",
+        "⚙️ Manage Habits"
+    ])
+
+    # -------------------------------------------------------------
+    # TAB 1: Daily Check-in Dashboard
+    # -------------------------------------------------------------
+    with tab_dashboard:
+        completed_ids = get_completed_habit_ids_for_date(selected_date)
+        total_count = len(habits)
+        done_count = len([h for h in habits if h["id"] in completed_ids])
+        pct_done = int((done_count / total_count) * 100) if total_count > 0 else 0
+
+        # Stats Cards Row
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(f"""
+                <div class="stat-tile">
+                    <div class="stat-label">Active Habits</div>
+                    <div class="stat-value">{total_count}</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"""
+                <div class="stat-tile">
+                    <div class="stat-label">Done on {date_label}</div>
+                    <div class="stat-value">{done_count} <span style="font-size:1rem;color:#94a3b8;">/ {total_count}</span></div>
+                </div>
+            """, unsafe_allow_html=True)
+        with c3:
+            st.markdown(f"""
+                <div class="stat-tile">
+                    <div class="stat-label">Consistency Rate</div>
+                    <div class="stat-value" style="color:#38bdf8;">{pct_done}%</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with c4:
+            active_streaks = [calculate_streaks(h["id"])["current_streak"] for h in habits]
+            best_curr = max(active_streaks) if active_streaks else 0
+            st.markdown(f"""
+                <div class="stat-tile">
+                    <div class="stat-label">Top Streak</div>
+                    <div class="stat-value" style="color:#f97316;">🔥 {best_curr}d</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        st.write("")
+        st.progress(pct_done / 100.0)
+
+        # 100% Day Completion Celebration
+        if done_count == total_count and total_count > 0:
+            st.markdown(f"""
+                <div style="background:linear-gradient(135deg, rgba(16,185,129,0.25), rgba(59,130,246,0.25)); border:1px solid #10b981; border-radius:14px; padding:12px 18px; margin:14px 0; text-align:center;">
+                    <span style="font-size:1.4rem;">🎉</span>
+                    <strong style="color:#6ee7b7; font-size:1.05rem; margin-left:8px;">All {total_count} habits completed for {date_label}!</strong>
+                    <div style="font-size:0.8rem; color:#cbd5e1; margin-top:2px;">Unstoppable discipline. Keep this momentum rolling!</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        # Routine Filter Chips
+        st.write("")
+        routine_filter = st.radio(
+            "Filter by Routine",
+            ["All", "🌅 Morning", "☀️ Afternoon", "🌙 Evening"],
+            horizontal=True,
+            label_visibility="collapsed"
+        )
+
+        filter_key = routine_filter.split()[-1] if routine_filter != "All" else "All"
+        filtered_habits = [
+            h for h in habits
+            if filter_key == "All" or h.get("routine", "Anytime") == filter_key or h.get("routine", "Anytime") == "Anytime"
+        ]
+
+        st.subheader(f"Habits for {date_label}")
+
+        # Render Habit Cards
+        for habit in filtered_habits:
+            h_id = habit["id"]
+            is_done = h_id in completed_ids
+            streak_info = calculate_streaks(h_id)
+            curr_streak = streak_info["current_streak"]
+            badge = get_streak_badge(curr_streak)
+
+            cat_gradient = CATEGORY_GRADIENTS.get(habit["category"], CATEGORY_GRADIENTS["Other"])
+            routine_text = habit.get("routine", "Anytime")
+
+            col_chk, col_info, col_streak = st.columns([0.08, 0.62, 0.30])
+
+            with col_chk:
+                chk = st.checkbox(
+                    "Check",
+                    value=is_done,
+                    key=f"card_chk_{h_id}_{selected_date}",
+                    label_visibility="collapsed"
+                )
+                if chk != is_done:
+                    new_state = toggle_habit_completion(h_id, selected_date)
+                    if new_state:
+                        # Check for milestone trigger
+                        new_streak = calculate_streaks(h_id)["current_streak"]
+                        new_badge = get_streak_badge(new_streak)
+                        if new_badge and new_streak in [3, 7, 14, 21, 30, 60]:
+                            st.session_state.milestone_alert = {
+                                "habit": habit["name"],
+                                "streak": new_streak,
+                                "badge": new_badge
+                            }
+                        st.session_state.celebration_pending = True
+                    st.rerun()
+
+            with col_info:
+                badge_html = f'<span class="category-pill" style="background:{cat_gradient};">{habit["category"]}</span>'
+                routine_html = f'<span class="routine-pill">{routine_text}</span>'
+                st.markdown(f"**{habit['icon']} {habit['name']}** &nbsp; {badge_html} &nbsp; {routine_html}", unsafe_allow_html=True)
+                if habit["description"]:
+                    st.caption(habit["description"])
+
+            with col_streak:
+                flame_html = f'<span class="flame-streak">🔥 {curr_streak} days</span>'
+                badge_markup = ""
+                if badge:
+                    badge_markup = f'<span class="milestone-badge" style="background:{badge["color"]}33; color:{badge["color"]}; border-color:{badge["color"]}; margin-left:6px;">{badge["title"]}</span>'
+
+                st.markdown(f"{flame_html} {badge_markup}", unsafe_allow_html=True)
+                st.caption(f"Best: **{streak_info['longest_streak']}d** | Total: **{streak_info['total_completions']}✓**")
+
+            st.divider()
+
+    # -------------------------------------------------------------
+    # TAB 2: Weekly Matrix View (Mobile Responsive)
+    # -------------------------------------------------------------
+    with tab_weekly:
+        st.subheader("🗓️ Current Week Consistency Matrix")
+        st.caption("Tap any day to log or update completions instantly.")
+
+        today = date.today()
+        start_of_week = today - timedelta(days=today.weekday())
+        week_dates = [start_of_week + timedelta(days=i) for i in range(7)]
+
+        for habit in habits:
+            h_id = habit["id"]
+            h_dates = get_all_completion_dates_for_habit(h_id)
+            days_done = sum(1 for d in week_dates if d in h_dates)
+            cat_grad = CATEGORY_GRADIENTS.get(habit["category"], CATEGORY_GRADIENTS["Other"])
+
+            st.markdown(f"""
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <div>
+                        <strong style="font-size:1.05rem;">{habit['icon']} {habit['name']}</strong>
+                        &nbsp;<span class="category-pill" style="background:{cat_grad}; font-size:0.65rem;">{habit['category']}</span>
+                    </div>
+                    <span style="font-weight:700; color:#38bdf8; font-size:0.9rem;">{days_done}/7 this week</span>
+                </div>
+            """, unsafe_allow_html=True)
+
+            day_cols = st.columns(7)
+            for i, d in enumerate(week_dates):
+                done = (d in h_dates)
+                today_marker = " •" if d == today else ""
+                label = f"{d.strftime('%a')}{today_marker}\n{d.strftime('%d')}"
+                with day_cols[i]:
+                    chk = st.checkbox(
+                        label,
+                        value=done,
+                        key=f"week_{h_id}_{d}",
+                    )
+                    if chk != done:
+                        toggle_habit_completion(h_id, d)
+                        st.rerun()
+
+            st.divider()
+
+    # -------------------------------------------------------------
+    # TAB 3: Milestones & Analytics
+    # -------------------------------------------------------------
+    with tab_analytics:
+        st.subheader("🏆 Consistency & Habit Mastery")
+
+        # 60-Day GitHub Consistency Heatmap
+        daily_counts = get_daily_completion_counts(days=60)
+        render_activity_heatmap(daily_counts, days=56)
+
+        st.write("")
+        st.subheader("🎖️ Streak Leaderboard & Milestones")
+
+        ranked_habits = sorted(
+            habits,
+            key=lambda h: (calculate_streaks(h["id"])["current_streak"], calculate_streaks(h["id"])["total_completions"]),
+            reverse=True
+        )
+
+        for rank, h in enumerate(ranked_habits, 1):
+            s = calculate_streaks(h["id"])
+            curr_s = s["current_streak"]
+            badge = get_streak_badge(curr_s)
+            cat_grad = CATEGORY_GRADIENTS.get(h["category"], CATEGORY_GRADIENTS["Other"])
+
+            r_col, name_col, streak_col, best_col, tot_col = st.columns([0.08, 0.42, 0.22, 0.14, 0.14])
+            with r_col:
+                medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"#{rank}"
+                st.write(f"### {medal}")
+            with name_col:
+                st.markdown(f"**{h['icon']} {h['name']}** &nbsp; <span class='category-pill' style='background:{cat_grad};'>{h['category']}</span>", unsafe_allow_html=True)
+                if badge:
+                    st.markdown(f"<span class='milestone-badge' style='background:{badge['color']}33; color:{badge['color']}; border-color:{badge['color']};'>{badge['title']}</span>", unsafe_allow_html=True)
+            with streak_col:
+                st.markdown(f"<span class='flame-streak'>🔥 {curr_s} days</span>", unsafe_allow_html=True)
+            with best_col:
+                st.metric("Best Streak", f"🏆 {s['longest_streak']}d")
+            with tot_col:
+                st.metric("Lifetime", f"{s['total_completions']}✓")
+
+            st.divider()
+
+        # Category Breakdown
+        st.subheader("🏷️ Category Distribution")
+        cat_data = get_completions_by_category()
+        if cat_data:
+            c_cols = st.columns(len(cat_data))
+            for i, (cat, count) in enumerate(cat_data.items()):
+                grad = CATEGORY_GRADIENTS.get(cat, CATEGORY_GRADIENTS["Other"])
+                with c_cols[i % len(c_cols)]:
+                    st.markdown(f"""
+                        <div style="background:{grad}; border-radius:12px; padding:12px; text-align:center; color:#fff; box-shadow:0 4px 12px rgba(0,0,0,0.3);">
+                            <div style="font-size:0.75rem; font-weight:700; opacity:0.9;">{cat.upper()}</div>
+                            <div style="font-size:1.6rem; font-weight:800; margin-top:2px;">{count}</div>
+                            <div style="font-size:0.65rem; opacity:0.85;">Total Completions</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+    # -------------------------------------------------------------
+    # TAB 4: Manage Habits
+    # -------------------------------------------------------------
+    with tab_manage:
+        st.subheader("⚙️ Manage Habits")
+        st.caption("Edit, review, or retire habits from your daily tracker.")
+
+        for h in habits:
+            m_col1, m_col2, m_col3 = st.columns([0.6, 0.25, 0.15])
+            with m_col1:
+                cat_grad = CATEGORY_GRADIENTS.get(h["category"], CATEGORY_GRADIENTS["Other"])
+                st.markdown(f"### {h['icon']} {h['name']} &nbsp; <span class='category-pill' style='background:{cat_grad};'>{h['category']}</span>", unsafe_allow_html=True)
+                st.write(f"Routine: **{h.get('routine', 'Anytime')}** | Created: `{h['created_at']}`")
+                if h["description"]:
+                    st.caption(f"Description: {h['description']}")
+
+            with m_col2:
+                s = calculate_streaks(h["id"])
+                st.metric("Total Check-ins", f"{s['total_completions']} times")
+
+            with m_col3:
+                st.write("")
+                st.write("")
+                if st.button("🗑️ Delete", key=f"del_{h['id']}", type="secondary"):
+                    delete_habit(h["id"])
+                    st.success(f"Deleted habit '{h['name']}'")
+                    st.rerun()
+
+            st.divider()
+
+
+if __name__ == "__main__":
+    main()
